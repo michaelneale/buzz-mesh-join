@@ -43,7 +43,7 @@ after `--` goes straight to `mesh-llm serve|client`.
 Needs Rust and a [mesh-llm](https://github.com/Mesh-LLM/mesh-llm/releases) release on PATH.
 
 ```sh
-cargo install --git https://github.com/michaelneale/buzz-mesh-join
+cargo install --locked --git https://github.com/michaelneale/buzz-mesh-join
 ```
 
 ## How it works
