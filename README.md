@@ -38,6 +38,11 @@ Leave it running. Community members now see it as shared compute in Buzz, and on
 
 **To stop:** Ctrl-C (it withdraws its advertisement). To remove it for good, remove the member in Buzz.
 
+**When membership changes** you do nothing on the box. It re-reads the roster every 30s:
+someone added is let in at once; someone removed is dropped once two reads agree. Either way it
+restarts its `mesh-llm` (reloading the model). If the box itself is removed, it stops `mesh-llm`
+and exits.
+
 Other commands:
 ```sh
 buzz-mesh-join client        # use other members' nodes: OpenAI API on :9337
@@ -116,5 +121,5 @@ Local, membership-gated buzz-relay from block/buzz main, mesh-llm v0.78.1:
   must use that id.
 - A roster change restarts the node (it reloads the model). A live update would need
   mesh-llm's `add_membership` (on main, after v0.78.1) or a trust-store reload.
-- A member removed from the roster keeps its own client process running, but serving nodes stop
-  admitting it.
+- A member removed from the roster keeps its own nodes running until they notice; serving nodes
+  stop admitting it either way. This tool's own node stops and exits once it sees it was removed.

@@ -22,6 +22,43 @@ use tokio::process::{Child, Command};
 
 const HEARTBEAT: Duration = Duration::from_secs(45);
 
+/// The relay answered, and this key is not a member: either the roster omits it
+/// (`no_roster: false`, authoritative) or the relay gave it no roster at all,
+/// which is how a hosted community answers a non-member (`no_roster: true`).
+#[derive(Debug)]
+struct NotMember {
+    no_roster: bool,
+}
+
+impl std::fmt::Display for NotMember {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.no_roster {
+            f.write_str("relay returned no NIP-43 roster (is this key a community member?)")
+        } else {
+            f.write_str("this key is not on the community roster")
+        }
+    }
+}
+
+impl std::error::Error for NotMember {}
+
+/// Whether to stop after this poll. An explicit roster without us is final at
+/// once; a missing roster must be seen twice, so one odd read can't stop a node.
+fn removal_confirmed(e: &anyhow::Error, missing_roster_before: &mut bool) -> bool {
+    match e.downcast_ref::<NotMember>() {
+        Some(NotMember { no_roster: false }) => true,
+        Some(NotMember { no_roster: true }) => {
+            let confirmed = *missing_roster_before;
+            *missing_roster_before = true;
+            confirmed
+        }
+        None => {
+            *missing_roster_before = false;
+            false
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
@@ -190,10 +227,20 @@ impl Supervisor<'_> {
         // Presence first: other members' serve nodes admit owners they can see.
         self.publish(&[]).await?;
         let mut pending_shrink: Option<Launch> = None;
+        let mut missing_roster = false;
         let mut last_beat = Instant::now();
         let mut advertised: Vec<(String, String)> = Vec::new();
         loop {
-            match self.desired().await {
+            let desired = self.desired().await;
+            if desired.is_ok() {
+                missing_roster = false;
+            }
+            match desired {
+                Err(e) if removal_confirmed(&e, &mut missing_roster) => {
+                    // Removed in Buzz: stop serving rather than run on a stale allowlist.
+                    self.stop_child().await;
+                    bail!("removed from the community: {e}; stopped mesh-llm");
+                }
                 Err(e) => eprintln!("roster query failed; keeping current node: {e:#}"),
                 Ok(None) => eprintln!("waiting for a serve target from another member"),
                 Ok(Some(want)) => {
@@ -253,9 +300,9 @@ impl Supervisor<'_> {
             events.extend(self.client.fetch_events(f, Duration::from_secs(10)).await?);
         }
         let members = protocol::members(&events, self.relay_self.as_ref())
-            .context("relay returned no NIP-43 roster (is this key a community member?)")?;
+            .ok_or(NotMember { no_roster: true })?;
         if !members.contains(&self.keys.public_key().to_hex()) {
-            bail!("this key is not on the community roster");
+            return Err(NotMember { no_roster: false }.into());
         }
         Ok((events, members))
     }
@@ -489,4 +536,23 @@ async fn relay_self_pubkey(relay: &str) -> Option<PublicKey> {
         .await
         .ok()?;
     PublicKey::from_hex(info.get("self")?.as_str()?).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removal_needs_explicit_roster_or_two_missing_rosters() {
+        let mut missing = false;
+        let gone = || anyhow::Error::new(NotMember { no_roster: false });
+        let none = || anyhow::Error::new(NotMember { no_roster: true });
+        let blip = || anyhow::anyhow!("timeout");
+        assert!(removal_confirmed(&gone(), &mut missing));
+        missing = false;
+        assert!(!removal_confirmed(&none(), &mut missing));
+        assert!(!removal_confirmed(&blip(), &mut missing), "a relay error resets the count");
+        assert!(!removal_confirmed(&none(), &mut missing));
+        assert!(removal_confirmed(&none(), &mut missing));
+    }
 }
