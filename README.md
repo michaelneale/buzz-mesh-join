@@ -89,8 +89,11 @@ and it does not publish or auto-join unless asked. This tool is just the glue:
 3. Publish this node's own binding, then, once serving, the invite token as `serveTargets`,
    covered by `ownerEndpointBindingSig`. Heartbeat every 45s and withdraw on exit.
 4. Poll the roster. Growth restarts mesh-llm with the new allowlist straight away; a shrink must be
-   seen twice first, so one relay blip can't drop everyone. The desktop works the same way.
-   mesh-llm only reads `--trust-owner` at startup.
+   seen twice first, so one relay blip can't drop everyone (up to about a minute). The Buzz desktop
+   ([buzz-app `mesh-compute`](https://github.com/block/buzz-app/blob/602944d9f/src/bundled/mesh-compute/compute/src/desktop/coordinator.rs))
+   is quicker: it re-reads the roster every 15s and drops a removed member on the first read that
+   leaves them out. Both restart only their mesh node, never Buzz. mesh-llm only reads
+   `--trust-owner` at startup.
 5. `client` picks a fresh, verified serve target from another member and runs
    `mesh-llm client --join <token>` with the same allowlist.
 
@@ -119,7 +122,10 @@ Local, membership-gated buzz-relay from block/buzz main, mesh-llm v0.78.1:
 - Agent keys that need a NIP-OA `auth` tag are not wired up; the node uses its own member key.
 - The served model is listed as `local-gguf/sha256-…`, not the name passed to `--model`, so requests
   must use that id.
-- A roster change restarts the node (it reloads the model). A live update would need
-  mesh-llm's `add_membership` (on main, after v0.78.1) or a trust-store reload.
+- A roster change restarts the node (it reloads the model). mesh-llm has no call to change a
+  running node's allowlist. Its `add_membership` (on main, after v0.78.1) joins the node to one
+  more mesh with its own allowlist while the model stays loaded, so a roster change could replace
+  that membership instead of restarting. It is only reachable through the SDK, not the `mesh-llm`
+  binary this tool wraps. Untried.
 - A member removed from the roster keeps its own nodes running until they notice; serving nodes
   stop admitting it either way. This tool's own node stops and exits once it sees it was removed.
