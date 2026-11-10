@@ -6,14 +6,47 @@ Run a **stock `mesh-llm` release binary** as a member of a Buzz community, headl
 - The node advertises itself with the same member-signed kind `30003` discovery note the Buzz
   desktop publishes, so desktop members see it as shared compute, and only members get in.
 
-```sh
-# On the GPU box: get an invite link from a community admin (Invite members in Buzz), then
-buzz-mesh-join join --accept-terms https://acme.communities.buzz.xyz/invite/<code>
+## Quick start
 
-buzz-mesh-join serve --model unsloth/Qwen3-8B-GGUF:Q4_K_M   # serve to members only
-buzz-mesh-join client                                       # OpenAI API on :9337 through a member's node
-buzz-mesh-join roster                                       # what the community advertises
+You need [mesh-llm](https://github.com/Mesh-LLM/mesh-llm/releases) on PATH, Rust, and an
+admin of the Buzz community.
+
+**1. Install**
+```sh
+cargo install --locked --git https://github.com/michaelneale/buzz-mesh-join
 ```
+
+**2. Get the node's npub** (it makes its own key the first time)
+```sh
+export BUZZ_RELAY_URL=wss://<community>.communities.buzz.xyz
+buzz-mesh-join whoami
+```
+
+**3. Add it to the community.** In Buzz, right-click the community → **Invite to community**
+(or **Settings → Membership → Invite members**) → add by npub → paste it.
+
+**4. Check it's in**
+```sh
+buzz-mesh-join roster        # lists members and the nodes they advertise
+```
+
+**5. Serve**
+```sh
+buzz-mesh-join serve --model unsloth/Qwen3-8B-GGUF:Q4_K_M
+```
+Leave it running. Community members now see it as shared compute in Buzz, and only members can use it.
+
+**To stop:** Ctrl-C (it withdraws its advertisement). To remove it for good, remove the member in Buzz.
+
+Other commands:
+```sh
+buzz-mesh-join client        # use other members' nodes: OpenAI API on :9337
+buzz-mesh-join join --accept-terms --age-confirmed https://<community>/invite/<code>   # instead of step 3
+```
+
+Running it on a Mac that already runs Buzz shared compute? Give it its own state and ports so
+it doesn't clash: `BUZZ_MESH_STATE=$PWD/node.json MESH_OWNER_KEY=$PWD/owner.json` and
+`--api-port 9447 --console-port 3241` before `serve`.
 
 ## Where the key comes from
 
@@ -38,14 +71,6 @@ Other options: `--mesh-llm <bin>` (default `mesh-llm` on PATH), `--owner-key <ke
 encrypted one on a headless box), `--api-port`, `--console-port`, `--poll-secs`. Anything
 after `--` goes straight to `mesh-llm serve|client`.
 
-## Install
-
-Needs Rust and a [mesh-llm](https://github.com/Mesh-LLM/mesh-llm/releases) release on PATH.
-
-```sh
-cargo install --locked --git https://github.com/michaelneale/buzz-mesh-join
-```
-
 ## How it works
 
 No mesh-llm changes are needed. Stock mesh-llm already has every knob:
@@ -66,8 +91,14 @@ and it does not publish or auto-join unless asked. This tool is just the glue:
 
 ## Verified
 
-- `join` against the live hosted community relay: NIP-98 auth and the terms step are accepted
-  (a made-up code is refused as `invite_invalid`, past auth). A real invite hasn't been redeemed yet.
+Live hosted community (meshllm.communities.buzz.xyz), added by npub:
+
+- `roster` reads the relay-signed roster (58 members, 44 with valid owner bindings).
+- `serve` publishes the binding and serve target, then peers with another member's **Buzz desktop**
+  node; each side verifies the other's owner. Inference through the headless node to the desktop's
+  Qwen3.5-9B works, so the desktop accepts this tool's discovery note.
+- `join` with an invite link: NIP-98 auth and the terms step are accepted (a made-up code is refused
+  as `invite_invalid`). A real invite hasn't been redeemed yet.
 
 Local, membership-gated buzz-relay from block/buzz main, mesh-llm v0.78.1:
 
@@ -81,8 +112,8 @@ Local, membership-gated buzz-relay from block/buzz main, mesh-llm v0.78.1:
 ## Limits
 
 - Agent keys that need a NIP-OA `auth` tag are not wired up; the node uses its own member key.
-- It hasn't been tried against a live Buzz desktop yet. The payload, tags and binding bytes follow
-  `desktop/src-tauri/src/mesh_llm/{identity,discovery,coordinator}.rs` line for line.
+- The served model is listed as `local-gguf/sha256-…`, not the name passed to `--model`, so requests
+  must use that id.
 - A roster change restarts the node (it reloads the model). A live update would need
   mesh-llm's `add_membership` (on main, after v0.78.1) or a trust-store reload.
 - A member removed from the roster keeps its own client process running, but serving nodes stop
