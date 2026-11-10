@@ -4,6 +4,7 @@
 //! discovery note the Buzz desktop app publishes, so desktop members see it
 //! as shared compute and this node admits exactly the community's members.
 
+mod node;
 mod protocol;
 
 use std::collections::BTreeSet;
@@ -24,12 +25,17 @@ const HEARTBEAT: Duration = Duration::from_secs(45);
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    /// Buzz community relay, e.g. wss://acme.communities.buzz.xyz
+    /// Buzz community relay, e.g. wss://acme.communities.buzz.xyz.
+    /// Defaults to the community joined with `join`.
     #[arg(long, env = "BUZZ_RELAY_URL")]
-    relay: String,
-    /// The member's Nostr secret key (nsec or hex). Must be on the community roster.
+    relay: Option<String>,
+    /// Use this Nostr secret key (nsec or hex) instead of the node's own key.
+    /// It must be on the community roster.
     #[arg(long, env = "BUZZ_NSEC", hide_env_values = true)]
-    nsec: String,
+    nsec: Option<String>,
+    /// Where the node keeps its own key and joined community.
+    #[arg(long, env = "BUZZ_MESH_STATE")]
+    state: Option<PathBuf>,
     /// MeshLLM owner keystore (created, unencrypted, if missing).
     #[arg(long, env = "MESH_OWNER_KEY")]
     owner_key: Option<PathBuf>,
@@ -64,18 +70,63 @@ enum Cmd {
     },
     /// Print the roster, verified owner bindings and serve targets, then exit.
     Roster,
+    /// Join a community with an invite link, as this node's own key.
+    Join {
+        /// https://<community>/invite/<code> or buzz://join?relay=…&code=…
+        invite: String,
+        /// Accept the community's terms and privacy policy, if it has them.
+        #[arg(long)]
+        accept_terms: bool,
+        /// Confirm the minimum age, if the community requires it.
+        #[arg(long)]
+        age_confirmed: bool,
+    },
+    /// Print this node's npub (an admin can add it to a community directly).
+    Whoami,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    let keys = Keys::parse(cli.nsec.trim()).context("parsing --nsec")?;
+    let mut cli = Cli::parse();
+    let state_path = match &cli.state {
+        Some(p) => p.clone(),
+        None => node::default_state_path()?,
+    };
+    let mut state = node::load(&state_path)?;
+    let keys = node::keys(cli.nsec.as_deref(), &state_path, &mut state)?;
+    match &cli.cmd {
+        Cmd::Whoami => {
+            println!("{}", keys.public_key().to_bech32()?);
+            if let Some(relay) = cli.relay.as_ref().or(state.relay.as_ref()) {
+                eprintln!("community: {relay}");
+            }
+            return Ok(());
+        }
+        Cmd::Join { invite, accept_terms, age_confirmed } => {
+            let invite = node::parse_invite(invite)?;
+            let status = node::claim(&keys, &invite, *accept_terms, *age_confirmed).await?;
+            state.relay = Some(invite.relay.clone());
+            node::save(&state_path, &state)?;
+            println!(
+                "{status}: {} is a member of {}",
+                keys.public_key().to_bech32()?,
+                invite.relay
+            );
+            return Ok(());
+        }
+        _ => {}
+    }
+    let relay = match cli.relay.clone().or(state.relay.clone()) {
+        Some(r) => r,
+        None => bail!("no community: run `buzz-mesh-join join <invite-link>` or set BUZZ_RELAY_URL"),
+    };
+    cli.relay = Some(relay.clone());
     let owner_path = match &cli.owner_key {
         Some(p) => p.clone(),
         None => default_keystore_path()?,
     };
     let owner = load_or_create_owner(&owner_path)?;
-    let relay_self = relay_self_pubkey(&cli.relay).await;
+    let relay_self = relay_self_pubkey(&relay).await;
     eprintln!(
         "member {} | owner {} | relay roster signer {}",
         keys.public_key().to_bech32()?,
@@ -89,7 +140,7 @@ async fn main() -> anyhow::Result<()> {
         .signer(keys.clone())
         .opts(ClientOptions::new().automatic_authentication(true))
         .build();
-    client.add_relay(&cli.relay).await?;
+    client.add_relay(&relay).await?;
     client.connect().await;
     client.wait_for_connection(Duration::from_secs(10)).await;
 
@@ -243,7 +294,7 @@ impl Supervisor<'_> {
             Cmd::Client { extra } => {
                 cmd.arg("client").args(extra);
             }
-            Cmd::Roster => unreachable!(),
+            Cmd::Roster | Cmd::Join { .. } | Cmd::Whoami => unreachable!(),
         }
         if let Some(token) = &launch.join {
             cmd.args(["--join", token]);
