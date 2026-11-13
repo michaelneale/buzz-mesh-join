@@ -33,8 +33,9 @@ pub fn default_state_path() -> anyhow::Result<PathBuf> {
 
 pub fn load(path: &Path) -> anyhow::Result<State> {
     match std::fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .with_context(|| format!("reading {}", path.display())),
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).with_context(|| format!("reading {}", path.display()))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(State::default()),
         Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
     }
@@ -123,7 +124,12 @@ fn nip98(keys: &Keys, url: &str, body: &[u8]) -> anyhow::Result<String> {
     ))
 }
 
-async fn post(http: &reqwest::Client, keys: Option<&Keys>, url: &str, body: Value) -> anyhow::Result<Value> {
+async fn post(
+    http: &reqwest::Client,
+    keys: Option<&Keys>,
+    url: &str,
+    body: Value,
+) -> anyhow::Result<Value> {
     let body = serde_json::to_vec(&body)?;
     let mut req = http
         .post(url)
