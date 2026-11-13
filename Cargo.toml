@@ -2,7 +2,7 @@
 name = "buzz-mesh-join"
 version = "0.1.0"
 edition = "2021"
-description = "Headless: join a stock mesh-llm node to a Buzz community (NIP-43 roster -> owner allowlist)"
+description = "Serve a model to a Buzz community, optionally sharing it with the public Mesh"
 license = "Apache-2.0"
 
 [dependencies]
@@ -10,7 +10,8 @@ anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 ed25519-dalek = "=3.0.0"
 hex = "0.4"
-mesh-llm-identity = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.78.1", features = ["host-io"] }
+mesh-llm-identity = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.79.0", features = ["host-io"] }
+mesh-llm-sdk = { git = "https://github.com/Mesh-LLM/mesh-llm.git", tag = "v0.79.0" }
 nostr-sdk = { version = "0.44", features = ["nip98"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 base64 = "0.22"
@@ -18,3 +19,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "time"] }
+
+[dev-dependencies]
+tempfile = "3"

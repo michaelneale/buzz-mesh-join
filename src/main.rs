@@ -1,11 +1,11 @@
-//! buzz-mesh-join: run a *stock* `mesh-llm` binary as a member of a Buzz
-//! community, headless. Buzz membership (NIP-43 roster) becomes the node's
-//! owner allowlist, and the node's endpoint is advertised in the same signed
-//! discovery note the Buzz desktop app publishes, so desktop members see it
-//! as shared compute and this node admits exactly the community's members.
+//! Serve into a Buzz community using a stock `mesh-llm` child, or opt in to
+//! an embedded SDK host sharing one model with the public Mesh. The Buzz
+//! endpoint has its own roster-derived owner allowlist and signed discovery
+//! note in either mode; public membership never inherits that private roster.
 
 mod node;
 mod protocol;
+mod public_mesh;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -92,14 +92,25 @@ struct Cli {
 
 #[derive(Subcommand, Clone)]
 enum Cmd {
-    /// Serve a model to the community's members only.
+    /// Serve a model to the community (optionally also to the public Mesh).
     Serve {
         #[arg(long)]
         model: String,
-        /// Extra args passed through to `mesh-llm serve`.
+        /// Share one loaded model with the public Mesh and a separate Buzz membership.
+        #[arg(long)]
+        public: bool,
+        /// Mesh TOML for model/runtime tuning in --public mode (no CLI passthrough).
+        #[arg(long, requires = "public")]
+        config: Option<PathBuf>,
+        /// Separate loopback API for the Buzz membership in --public mode.
+        #[arg(long, default_value_t = 9338, requires = "public")]
+        buzz_api_port: u16,
+        /// Extra args passed through to stock `mesh-llm serve` (Buzz-only mode).
         #[arg(last = true)]
         extra: Vec<String>,
     },
+    /// Explicitly download/cache the recommended native runtime for --public mode.
+    InstallRuntime,
     /// Join a member's served node and expose it on the local OpenAI port.
     Client {
         #[arg(last = true)]
@@ -124,7 +135,17 @@ enum Cmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // The SDK engine can re-exec this binary for a built-in plugin.
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("--plugin") {
+        let name = args.next().context("--plugin needs a plugin name")?;
+        return mesh_llm_sdk::plugin::run_plugin_process(name, args.collect()).await;
+    }
     let mut cli = Cli::parse();
+    public_mesh::validate(&cli)?;
+    if matches!(cli.cmd, Cmd::InstallRuntime) {
+        return public_mesh::install_runtime().await;
+    }
     let state_path = match &cli.state {
         Some(p) => p.clone(),
         None => node::default_state_path()?,
@@ -139,7 +160,11 @@ async fn main() -> anyhow::Result<()> {
             }
             return Ok(());
         }
-        Cmd::Join { invite, accept_terms, age_confirmed } => {
+        Cmd::Join {
+            invite,
+            accept_terms,
+            age_confirmed,
+        } => {
             let invite = node::parse_invite(invite)?;
             let status = node::claim(&keys, &invite, *accept_terms, *age_confirmed).await?;
             state.relay = Some(invite.relay.clone());
@@ -155,7 +180,9 @@ async fn main() -> anyhow::Result<()> {
     }
     let relay = match cli.relay.clone().or(state.relay.clone()) {
         Some(r) => r,
-        None => bail!("no community: run `buzz-mesh-join join <invite-link>` or set BUZZ_RELAY_URL"),
+        None => {
+            bail!("no community: run `buzz-mesh-join join <invite-link>` or set BUZZ_RELAY_URL")
+        }
     };
     cli.relay = Some(relay.clone());
     let owner_path = match &cli.owner_key {
@@ -189,6 +216,7 @@ async fn main() -> anyhow::Result<()> {
         client: &client,
         relay_self,
         child: None,
+        public_node: None,
     };
     let result = tokio::select! {
         r = sup.run() => r,
@@ -199,8 +227,12 @@ async fn main() -> anyhow::Result<()> {
         let _ = sup.publish(&[]).await;
     }
     sup.stop_child().await;
+    let shutdown = match sup.public_node.take() {
+        Some(node) => node.shutdown().await.context("stopping public Mesh node"),
+        None => Ok(()),
+    };
     client.disconnect().await;
-    result
+    result.and(shutdown)
 }
 
 struct Supervisor<'a> {
@@ -211,6 +243,7 @@ struct Supervisor<'a> {
     client: &'a Client,
     relay_self: Option<PublicKey>,
     child: Option<(Child, Launch)>,
+    public_node: Option<mesh_llm_sdk::MeshNode>,
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -223,6 +256,9 @@ impl Supervisor<'_> {
     async fn run(&mut self) -> anyhow::Result<()> {
         if matches!(self.cli.cmd, Cmd::Roster) {
             return self.print_roster().await;
+        }
+        if matches!(self.cli.cmd, Cmd::Serve { public: true, .. }) {
+            return public_mesh::run(self).await;
         }
         // Presence first: other members' serve nodes admit owners they can see.
         self.publish(&[]).await?;
@@ -335,13 +371,13 @@ impl Supervisor<'_> {
         self.stop_child().await;
         let mut cmd = Command::new(&self.cli.mesh_llm);
         match &self.cli.cmd {
-            Cmd::Serve { model, extra } => {
+            Cmd::Serve { model, extra, .. } => {
                 cmd.args(["serve", "--model", model]).args(extra);
             }
             Cmd::Client { extra } => {
                 cmd.arg("client").args(extra);
             }
-            Cmd::Roster | Cmd::Join { .. } | Cmd::Whoami => unreachable!(),
+            Cmd::Roster | Cmd::Join { .. } | Cmd::Whoami | Cmd::InstallRuntime => unreachable!(),
         }
         if let Some(token) = &launch.join {
             cmd.args(["--join", token]);
@@ -429,40 +465,7 @@ impl Supervisor<'_> {
             .unwrap_or("")
             .trim()
             .to_string();
-        // Same model ids the desktop advertises: hosted models plus ready runtime models.
-        let mut out: Vec<(String, String)> = Vec::new();
-        if token.is_empty() {
-            return Ok(out);
-        }
-        let ids = |v: Option<&serde_json::Value>| -> Vec<String> {
-            v.and_then(|v| v.as_array())
-                .into_iter()
-                .flatten()
-                .filter_map(|m| m.as_str().map(str::to_string))
-                .collect()
-        };
-        for id in ids(status.get("hosted_models")) {
-            out.push((id, token.clone()));
-        }
-        for m in status
-            .pointer("/runtime/models")
-            .and_then(|v| v.as_array())
-            .into_iter()
-            .flatten()
-        {
-            if m.get("status").and_then(|v| v.as_str()) == Some("ready") {
-                if let Some(id) = m
-                    .get("model_id")
-                    .or_else(|| m.get("name"))
-                    .and_then(|v| v.as_str())
-                {
-                    out.push((id.to_string(), token.clone()));
-                }
-            }
-        }
-        out.sort();
-        out.dedup();
-        Ok(out)
+        Ok(ready_targets_from_status(&status, &token))
     }
 
     async fn publish(&self, targets: &[(String, String)]) -> anyhow::Result<()> {
@@ -496,6 +499,45 @@ impl Supervisor<'_> {
         }
         Ok(())
     }
+}
+
+/// Local models only. The caller supplies the endpoint for the intended mesh,
+/// never a peer's model or (in dual mode) the public node's token.
+fn ready_targets_from_status(status: &serde_json::Value, token: &str) -> Vec<(String, String)> {
+    let token = token.trim();
+    if token.is_empty() {
+        return Vec::new();
+    }
+    let mut models = BTreeSet::new();
+    for model in status
+        .get("hosted_models")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m.as_str())
+    {
+        models.insert(model.to_string());
+    }
+    for model in status
+        .pointer("/runtime/models")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+    {
+        if model.get("status").and_then(|v| v.as_str()) == Some("ready") {
+            if let Some(id) = model
+                .get("model_id")
+                .or_else(|| model.get("name"))
+                .and_then(|v| v.as_str())
+            {
+                models.insert(id.to_string());
+            }
+        }
+    }
+    models
+        .into_iter()
+        .map(|id| (id, token.to_string()))
+        .collect()
 }
 
 fn now() -> u64 {
@@ -551,7 +593,10 @@ mod tests {
         assert!(removal_confirmed(&gone(), &mut missing));
         missing = false;
         assert!(!removal_confirmed(&none(), &mut missing));
-        assert!(!removal_confirmed(&blip(), &mut missing), "a relay error resets the count");
+        assert!(
+            !removal_confirmed(&blip(), &mut missing),
+            "a relay error resets the count"
+        );
         assert!(!removal_confirmed(&none(), &mut missing));
         assert!(removal_confirmed(&none(), &mut missing));
     }
