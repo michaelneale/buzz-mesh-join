@@ -839,6 +839,7 @@ dependencies = [
  "mesh-llm-sdk",
  "nostr-sdk 0.44.1",
  "reqwest 0.12.28",
+ "rustls",
  "serde",
  "serde_json",
  "sha2 0.10.9",

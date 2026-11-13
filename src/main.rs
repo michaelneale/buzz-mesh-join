@@ -133,8 +133,14 @@ enum Cmd {
     Whoami,
 }
 
+fn init_tls_crypto() {
+    // The SDK and Nostr enable different providers; select before any TLS client.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    init_tls_crypto();
     // The SDK engine can re-exec this binary for a built-in plugin.
     let mut args = std::env::args().skip(1);
     if args.next().as_deref() == Some("--plugin") {
@@ -583,6 +589,14 @@ async fn relay_self_pubkey(relay: &str) -> Option<PublicKey> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tls_provider_is_ready_without_starting_the_sdk() {
+        init_tls_crypto();
+        init_tls_crypto(); // Repeated initialization must leave the installed provider intact.
+        assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+        let _ = rustls::ClientConfig::builder();
+    }
 
     #[test]
     fn removal_needs_explicit_roster_or_two_missing_rosters() {
