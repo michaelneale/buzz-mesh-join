@@ -91,8 +91,20 @@ fn primary_config(cli: &Cli, owner_path: &Path) -> EmbeddedMeshNodeConfig {
 /// Byte-compatible with Buzz's mesh-compute `mesh_name_for_relay`.
 fn mesh_name_for_relay(relay: &str) -> String {
     let trimmed = relay.trim();
+    // Desktops name the mesh from the community's https origin; a wss relay
+    // URL must hash the same, or this membership founds a separate mesh.
     let normalized = reqwest::Url::parse(trimmed)
-        .map(|url| url.origin().ascii_serialization())
+        .map(|mut url| {
+            let scheme = match url.scheme() {
+                "wss" => Some("https"),
+                "ws" => Some("http"),
+                _ => None,
+            };
+            if let Some(scheme) = scheme {
+                let _ = url.set_scheme(scheme);
+            }
+            url.origin().ascii_serialization()
+        })
         .unwrap_or_else(|_| trimmed.trim_end_matches('/').to_ascii_lowercase());
     format!(
         "buzz-community-{}",
@@ -279,8 +291,10 @@ mod tests {
 
     #[test]
     fn community_identity_matches_buzz_and_normalizes_origin() {
-        let expected = "buzz-community-d91dbf16b4343b6383e4ff067f7d9ecc";
+        // What desktops use: the mesh name of the community's https origin.
+        let expected = "buzz-community-0a29fd004034a7be333a3286b0a1be74";
         for relay in [
+            "https://meshllm.communities.buzz.xyz",
             "wss://meshllm.communities.buzz.xyz/",
             " WSS://MESHLLM.COMMUNITIES.BUZZ.XYZ/path?ignored=1 ",
         ] {
