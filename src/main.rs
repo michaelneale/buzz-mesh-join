@@ -474,8 +474,47 @@ impl Supervisor<'_> {
         Ok(ready_targets_from_status(&status, &token))
     }
 
+    /// Best-effort readable labels from the local console; never blocks publishing.
+    async fn labels(&self) -> protocol::Labels {
+        let mut labels = protocol::Labels::default();
+        let Ok(http) = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+        else {
+            return labels;
+        };
+        let base = format!("http://127.0.0.1:{}", self.cli.console_port);
+        let get = |path: &str| {
+            let req = http.get(format!("{base}{path}"));
+            async move {
+                req.send()
+                    .await
+                    .ok()?
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+            }
+        };
+        if let Some(status) = get("/api/status").await {
+            labels.node_name = status
+                .get("my_hostname")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned);
+            labels.vram_gb = status.get("my_vram_gb").and_then(|v| v.as_f64());
+        }
+        if let Some(models) = get("/api/models").await {
+            labels.model_names = model_names(&models);
+        }
+        labels
+    }
+
     async fn publish(&self, targets: &[(String, String)]) -> anyhow::Result<()> {
-        let event = protocol::status_event(self.keys, self.owner, targets)?;
+        let labels = if targets.is_empty() {
+            protocol::Labels::default()
+        } else {
+            self.labels().await
+        };
+        let event = protocol::status_event(self.keys, self.owner, targets, &labels)?;
         let out = self.client.send_event(&event).await?;
         if out.success.is_empty() {
             bail!("relay rejected status note: {:?}", out.failed);
@@ -546,6 +585,22 @@ fn ready_targets_from_status(status: &serde_json::Value, token: &str) -> Vec<(St
         .collect()
 }
 
+/// Model id -> readable ref from `/api/models`, skipping hash-only labels.
+fn model_names(models: &serde_json::Value) -> std::collections::BTreeMap<String, String> {
+    models
+        .get("mesh_models")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|m| {
+            let id = m.get("name")?.as_str()?;
+            let name = m.get("display_name")?.as_str()?.trim();
+            (!name.is_empty() && name != id && !name.starts_with("local-gguf/"))
+                .then(|| (id.to_owned(), name.to_owned()))
+        })
+        .collect()
+}
+
 fn now() -> u64 {
     Timestamp::now().as_secs()
 }
@@ -613,5 +668,17 @@ mod tests {
         );
         assert!(!removal_confirmed(&none(), &mut missing));
         assert!(removal_confirmed(&none(), &mut missing));
+    }
+
+    #[test]
+    fn model_names_skip_hash_labels() {
+        let v = serde_json::json!({"mesh_models": [
+            {"name": "local-gguf/sha256-a", "display_name": "org/A-GGUF:Q4"},
+            {"name": "local-gguf/sha256-b", "display_name": "local-gguf/sha256-b"},
+            {"name": "plain", "display_name": "plain"}
+        ]});
+        let n = super::model_names(&v);
+        assert_eq!(n.len(), 1);
+        assert_eq!(n["local-gguf/sha256-a"], "org/A-GGUF:Q4");
     }
 }

@@ -188,11 +188,24 @@ pub fn serve_targets(
 }
 
 /// The member-signed status note the desktop publishes (same shape and tags).
+/// Readable labels for advertised targets. Buzz shows a hash when these are absent.
+#[derive(Debug, Default, Clone)]
+pub struct Labels {
+    pub model_names: std::collections::BTreeMap<String, String>,
+    pub node_name: Option<String>,
+    pub vram_gb: Option<f64>,
+}
+
 pub fn status_event(
     keys: &Keys,
     owner: &OwnerKeypair,
     targets: &[(String, String)],
+    labels: &Labels,
 ) -> anyhow::Result<Event> {
+    let capacity = labels
+        .vram_gb
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .map(|v| serde_json::json!({ "vramGb": v }));
     let member = keys.public_key().to_hex();
     let tokens: Vec<String> = targets.iter().map(|(_, ep)| ep.clone()).collect();
     let payload = serde_json::json!({
@@ -202,9 +215,12 @@ pub fn status_event(
         "ownerEndpointBindingSig":
             hex::encode(owner.sign_bytes(&member_endpoint_binding_bytes(&member, &tokens))),
         "serveTargets": targets.iter().map(|(m, ep)| serde_json::json!({
-            "modelId": m, "modelName": null, "endpointAddr": ep, "nodeName": null, "capacity": null,
+            "modelId": m, "modelName": labels.model_names.get(m), "endpointAddr": ep,
+            "nodeName": labels.node_name, "capacity": capacity,
         })).collect::<Vec<_>>(),
-        "models": targets.iter().map(|(m, _)| serde_json::json!({"id": m})).collect::<Vec<_>>(),
+        "models": targets.iter().map(|(m, _)| serde_json::json!({
+            "id": m, "name": labels.model_names.get(m),
+        })).collect::<Vec<_>>(),
     });
     let d = format!("{STATUS_D_PREFIX}:{}", owner.owner_id());
     Ok(
@@ -240,9 +256,9 @@ mod tests {
         let target = vec![("m".to_string(), "tok".to_string())];
         let events = vec![
             roster(&relay, &[&a, &b]),
-            status_event(&a, &oa, &target).unwrap(),
-            status_event(&b, &ob, &[]).unwrap(),
-            status_event(&stranger, &os, &target).unwrap(),
+            status_event(&a, &oa, &target, &Labels::default()).unwrap(),
+            status_event(&b, &ob, &[], &Labels::default()).unwrap(),
+            status_event(&stranger, &os, &target, &Labels::default()).unwrap(),
         ];
         let m = members(&events, Some(&relay.public_key())).unwrap();
         let allow = allowlist(&events, &m);
@@ -258,7 +274,8 @@ mod tests {
     fn substituted_endpoint_is_rejected() {
         let a = Keys::generate();
         let oa = OwnerKeypair::generate();
-        let good = status_event(&a, &oa, &[("m".into(), "tok".into())]).unwrap();
+        let good =
+            status_event(&a, &oa, &[("m".into(), "tok".into())], &Labels::default()).unwrap();
         let forged = good.content.replace("\"tok\"", "\"evil\"");
         let forged = EventBuilder::new(good.kind, forged)
             .tags(good.tags.clone())
@@ -285,5 +302,32 @@ mod tests {
             hex::encode(d.finalize())
         );
         assert_eq!(got, want.into_bytes());
+    }
+
+    #[test]
+    fn labels_are_advertised_for_buzz_display() {
+        let (k, o) = (Keys::generate(), OwnerKeypair::generate());
+        let mut labels = Labels {
+            node_name: Some("box".into()),
+            vram_gb: Some(80.0),
+            ..Default::default()
+        };
+        labels
+            .model_names
+            .insert("local-gguf/sha256-ab".into(), "org/Model-GGUF:Q4".into());
+        let e = status_event(
+            &k,
+            &o,
+            &[("local-gguf/sha256-ab".into(), "tok".into())],
+            &labels,
+        )
+        .unwrap();
+        let c: serde_json::Value = serde_json::from_str(&e.content).unwrap();
+        let t = &c["serveTargets"][0];
+        assert_eq!(t["modelName"], "org/Model-GGUF:Q4");
+        assert_eq!(t["nodeName"], "box");
+        assert_eq!(t["capacity"]["vramGb"], 80.0);
+        assert_eq!(c["models"][0]["name"], "org/Model-GGUF:Q4");
+        assert_eq!(verified_targets(&e).len(), 1);
     }
 }

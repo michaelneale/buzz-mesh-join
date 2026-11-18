@@ -414,9 +414,13 @@ mod tests {
         assert!(ready_targets_from_status(&status, " ").is_empty());
         let keys = nostr_sdk::Keys::generate();
         let owner = mesh_llm_identity::OwnerKeypair::generate();
-        let event =
-            protocol::status_event(&keys, &owner, &ready_targets_from_status(&status, "BUZZ"))
-                .unwrap();
+        let event = protocol::status_event(
+            &keys,
+            &owner,
+            &ready_targets_from_status(&status, "BUZZ"),
+            &protocol::Labels::default(),
+        )
+        .unwrap();
         assert!(!event.content.contains("PUBLIC-NOT-BUZZ"));
         assert_eq!(protocol::verified_targets(&event).len(), 3);
     }
